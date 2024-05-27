@@ -6,11 +6,15 @@ import torch.optim as optim
 import numpy as np
 import os
 
-SCREEN_WIDTH = 100
-SCREEN_HEIGHT = 100
+torch.set_default_tensor_type("torch.cuda.FloatTensor")
+
+SCREEN_WIDTH = 250
+SCREEN_HEIGHT = 250#250
 
 FRUIT_SIZE = 10
 SNAKE_SIZE = 10
+
+VIEW_SIZE = 10
 
 from pygame.locals import (
     K_UP,
@@ -24,15 +28,14 @@ from pygame.locals import (
 class Agent(nn.Module):
     def __init__(self):
         super(Agent, self).__init__()
-        self.fc1 = nn.Linear(100, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 128)
-        self.fc4 = nn.Linear(128, 4)
+        self.fc1 = nn.Linear(VIEW_SIZE**2 + 9, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc4 = nn.Linear(512, 4)
         self.gamma = 0.99
-        self.epsilon = 1
-        self.epsilon_decay = 0.996
-        self.epsilon_min = 0.01
-        self.lr = 0.001
+        self.epsilon = 0.007
+        self.epsilon_decay = 0.999975
+        self.epsilon_min = 0.007
+        self.lr = 0.0002
         self.memory = []
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.criterion = nn.MSELoss()
@@ -46,7 +49,7 @@ class Agent(nn.Module):
         self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
 
     def select_action(self, state):
-        if random.random() < self.epsilon:
+        if random.random() <= self.epsilon:
             return random.randint(0, self.action_space - 1)
         else:
             state = self.preprocess_state(state)
@@ -56,6 +59,8 @@ class Agent(nn.Module):
     def update_model(self):
         if len(self.memory) < self.batch_size:
             return
+        if len(self.memory) > 10000:
+            self.memory = self.memory[len(self.memory) - 10000:]
         batch = random.sample(self.memory, self.batch_size)
         state, action, reward, next_state = zip(*batch)
         state = torch.cat(state)
@@ -75,7 +80,6 @@ class Agent(nn.Module):
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        x = torch.relu(self.fc3(x))
         x = self.fc4(x)
         return x
 
@@ -94,8 +98,10 @@ class Snake:
         self.color = (0, 212, 0)
         self.is_growing = 0
         self._game = game
+        self.prev_loc = [-1, -1]
 
     def move(self, direction):
+        self.prev_loc = self.loc[0]
         if direction == "UP" and self.direction == "DOWN":
             direction = self.direction
         elif direction == "DOWN" and self.direction == "UP":
@@ -112,11 +118,11 @@ class Snake:
         # Check if the new head position collides with the walls
         if new_head[0] < 0 or new_head[0] >= SCREEN_WIDTH or new_head[1] < 0 or new_head[1] >= SCREEN_HEIGHT:
             self._game.running = False
-            return -9999
+            return -100
         
         if new_head in self.loc:
             self._game.running = False
-            return -9999
+            return -100
 
         self.loc = [new_head] + self.loc
         if self.is_growing > 0:
@@ -124,7 +130,8 @@ class Snake:
         else:
             self.loc.pop()
         self.direction = direction
-        return -0.1
+        return -1
+
     def eat(self):
         self.is_growing += 1
 
@@ -138,47 +145,68 @@ class Game:
         self.is_ai = False
         self.agent = Agent()
         self.model_path = "snake_ai_model.pt"  # Path to save and load the model
-        self.game_counter=1
+        self.game_counter = 0
+        self.score = 0
+        self.current_score = 0
+        self.highest = self.score
+
         # Load the model if exists
         try:
-            self.agent.load_state_dict(torch.load(self.model_path))
+            checkpoint = torch.load(self.model_path)
+            self.agent.load_state_dict(checkpoint['model_state_dict'])
+            self.agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print("Model loaded successfully!")
         except FileNotFoundError:
             print("No saved model found. Training from scratch...")
 
     def get_game_state(self):
         head_x, head_y = self.snake.loc[0]
+        direction = self.snake.direction
+        future_head = [head_x + self.snake._moves[direction][0], head_y + self.snake._moves[direction][1]]
 
-        grid = np.zeros((10, 10))
+        grid = np.zeros((VIEW_SIZE, VIEW_SIZE))
 
-        for i in range(-5, 5):
-            for j in range(-5, 5):
-                x = head_x + i * SNAKE_SIZE
-                y = head_y + j * SNAKE_SIZE
-
+        for i in range(-VIEW_SIZE//2, VIEW_SIZE//2):
+            for j in range(-VIEW_SIZE//2, VIEW_SIZE//2):
+                x = head_x + i*SNAKE_SIZE
+                y = head_y + j*SNAKE_SIZE
                 # If the position is out of bounds, mark it as a wall
                 if x < 0 or x >= SCREEN_WIDTH or y < 0 or y >= SCREEN_HEIGHT:
-                    grid[i + 5][j + 5] = -1  # -1 represents a wall
+                    grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = -1  # -1 represents a wall
                 # If the position is the snake's body, mark it as a part of the snake
                 elif [x, y] in self.snake.loc:
-                    grid[i + 5][j + 5] = 1  # 1 represents a part of the snake
+                    if [x, y] == self.snake.loc[0]:
+                        grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 4  # 4 represents the head of the snake
+                    elif [x, y] == self.snake.loc[-1]:
+                        grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 5  # 5 represents the tail of the snake
+                    else:
+                        grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 1  # 1 represents a part of the snake
                 # If the position is the fruit, mark it as the fruit
                 elif (x, y) == self.fruit.loc:
-                    grid[i + 5][j + 5] = 2  # 2 represents the fruit
+                    grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 2  # 2 represents the fruit
+                # If the position is the future head, mark it as the future head
+                elif [x, y] == future_head:
+                    grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 3  # 3 represents the future head
                 else:
-                    grid[i + 5][j + 5] = 0  # 0 represents an empty space
+                    grid[i + VIEW_SIZE//2][j + VIEW_SIZE//2] = 0  # 0 represents an empty space
 
-        return grid.flatten()
-    
-    
+        view_size_encoding = np.array([SCREEN_HEIGHT//SNAKE_SIZE, SCREEN_WIDTH//SNAKE_SIZE])
+        snake_location_encoding = np.array([self.snake.loc[0][0]//SNAKE_SIZE, self.snake.loc[0][1]//SNAKE_SIZE])
+        snake_prev_location_encoding = np.array([self.snake.prev_loc[0]//SNAKE_SIZE, self.snake.prev_loc[1]//SNAKE_SIZE])
+        fruit_location_encoding = np.array([self.fruit.loc[0]//FRUIT_SIZE, self.fruit.loc[1]//FRUIT_SIZE])
+        snake_length_encoding = np.array([len(self.snake.loc)])
+        return np.concatenate((grid.flatten(), view_size_encoding, snake_location_encoding, fruit_location_encoding, snake_length_encoding, snake_prev_location_encoding))
+
     def take_action(self, action):
         directions = ["UP", "DOWN", "LEFT", "RIGHT"]
         direction = directions[action]
-        reward=self.snake.move(direction)
+        reward = self.snake.move(direction)
         if self.snake.loc[0] == list(self.fruit.loc):
             self.snake.eat()
             self.fruit = Fruit()
-            return 1000.0
+            self.score += 1
+            self.current_score += 1
+            return 10
         return reward
 
     def main_loop(self):
@@ -222,10 +250,21 @@ class Game:
                 if not self.is_ai:
                     self.clock.tick(10)
 
-            # Save the model upon death
-            torch.save(self.agent.state_dict(), self.model_path)
+            # Save the model and optimizer upon death
+            torch.save({
+                'model_state_dict': self.agent.state_dict(),
+                'optimizer_state_dict': self.agent.optimizer.state_dict(),
+            }, self.model_path)
 
             # Reset the game
+            self.game_counter += 1
+            self.highest = max(self.current_score, self.highest)
+            self.current_score = 0
+            os.system("cls")
+            print(f"Highest score of current agent during this run is: {self.highest}")
+            print(f"Average score per game is: {self.score / self.game_counter}")
+            print(f"epsilon value is: {self.agent.epsilon}")
+            print(f"{self.game_counter} games learned")
             self.snake = Snake(self)
             self.fruit = Fruit()
             self.running = True
@@ -235,3 +274,4 @@ game = Game()
 game.is_ai = True
 game.main_loop()
 pygame.quit()
+
